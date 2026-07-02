@@ -208,9 +208,10 @@
 <script>
 // ---------------------------------------------------------------------------
 // State — mirrored from the shared server (GET /api/reviews). Every local change
-// optimistically updates the UI, then POSTs the full { reviews, settings } to the
-// server. A poll (every ~3.5s and on window focus) pulls in changes anyone else
-// made so they appear without a manual refresh.
+// optimistically updates the UI, then POSTs only the review(s) that actually changed
+// (per-review upsert / delete) — never the whole array — so concurrent edits from
+// anyone else (or the G2 cron) can't clobber each other. A poll (every ~3.5s and on
+// window focus) pulls in others' changes so they appear without a manual refresh.
 // ---------------------------------------------------------------------------
 let reviews = [];
 let settings = { companyName: 'Hire Overseas', signerName: '', toneMode: 'founder' };
@@ -240,20 +241,21 @@ async function apiGet() {
   return res.json();
 }
 
-async function pushState(logEntry) {
+// Send a targeted set of operations to the server:
+//   { upsert: [review, ...], delete: [id, ...], settings: {...}, logEntry: {text} }
+// The server applies each and returns the full merged state, which we adopt.
+async function pushOps(ops) {
   inflightWrites++;
   try {
     const res = await fetch('/api/reviews', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ reviews, settings, logEntry: logEntry || null })
+      body: JSON.stringify(ops || {})
     });
     if (!res.ok) throw new Error((await safeError(res)) || ('HTTP ' + res.status));
     const data = await res.json();
-    activityLog = data.activityLog || activityLog;
-    lastServerSnapshot = JSON.stringify({ reviews: data.reviews || [], settings: data.settings || {} });
     dirty = false;
-    renderActivity();
+    reconcile(data);
     setSyncBadge('ok');
   } catch (err) {
     setSyncBadge('err');
@@ -261,6 +263,23 @@ async function pushState(logEntry) {
   } finally {
     inflightWrites--;
   }
+}
+
+// Adopt the server's authoritative merged state after a write. The server returns
+// the full reviews array (our change merged, per-field, with everyone else's), so we
+// pick up concurrent edits and never lose them. We skip re-applying the list while
+// the user is mid-edit in a reply box — the next poll reconciles once they move on.
+function reconcile(data) {
+  activityLog = data.activityLog || activityLog;
+  const active = document.activeElement;
+  const editing = active && active.classList && active.classList.contains('reply');
+  if (!editing) {
+    reviews = data.reviews || [];
+    settings = Object.assign({ companyName: 'Hire Overseas', signerName: '', toneMode: 'founder' }, data.settings || {});
+    lastServerSnapshot = JSON.stringify({ reviews: data.reviews || [], settings: data.settings || {} });
+    render();
+  }
+  renderActivity();
 }
 
 async function apiDraft(review, isRegenerate) {
@@ -337,9 +356,12 @@ async function generateReply(id, isRegenerate) {
     if (!review.status) review.status = 'needs_reply';
     dirty = true;
     render();
-    await pushState({
-      text: (isRegenerate ? 'Regenerated the reply for ' : 'Drafted a reply for ')
-        + (review.reviewer || 'Anonymous') + ' (' + review.platform + ')'
+    await pushOps({
+      upsert: [review],
+      logEntry: {
+        text: (isRegenerate ? 'Regenerated the reply for ' : 'Drafted a reply for ')
+          + (review.reviewer || 'Anonymous') + ' (' + review.platform + ')'
+      }
     });
   } catch (err) {
     showToast('Could not draft a reply: ' + err.message);
@@ -356,7 +378,7 @@ function updateReplyText(id, value) {
   review.reply = value;
   dirty = true;
   clearTimeout(replyDebounce);
-  replyDebounce = setTimeout(() => pushState(null), 500);
+  replyDebounce = setTimeout(() => pushOps({ upsert: [review] }), 500);
 }
 
 function updateStatus(id, value) {
@@ -369,7 +391,7 @@ function updateStatus(id, value) {
   const log = (value === 'posted' && !wasPosted)
     ? { text: 'Marked ' + (review.reviewer || 'Anonymous') + "'s reply as posted" }
     : null;
-  pushState(log);
+  pushOps({ upsert: [review], logEntry: log });
 }
 
 function deleteReview(id) {
@@ -378,9 +400,12 @@ function deleteReview(id) {
   reviews = reviews.filter(r => r.id !== id);
   dirty = true;
   render();
-  pushState(review
-    ? { text: 'Deleted the review from ' + (review.reviewer || 'Anonymous') + ' (' + review.platform + ')' }
-    : null);
+  pushOps({
+    delete: [id],
+    logEntry: review
+      ? { text: 'Deleted the review from ' + (review.reviewer || 'Anonymous') + ' (' + review.platform + ')' }
+      : null
+  });
 }
 
 function copyReply(id) {
@@ -598,7 +623,7 @@ document.getElementById('saveSettingsBtn').addEventListener('click', () => {
   document.getElementById('settingsPanel').classList.remove('open');
   showToast('Settings saved');
   render();
-  pushState(null);
+  pushOps({ settings });
 });
 
 // Add review modal
@@ -619,7 +644,7 @@ document.getElementById('submitAdd').addEventListener('click', () => {
   const id = 'r-' + Date.now() + '-' + Math.random().toString(36).slice(2, 7);
   const platform = document.getElementById('f_platform').value;
   const reviewer = document.getElementById('f_reviewer').value.trim();
-  reviews.push({
+  const review = {
     id,
     platform,
     reviewer,
@@ -628,11 +653,12 @@ document.getElementById('submitAdd').addEventListener('click', () => {
     text,
     reply: '',
     status: 'needs_reply'
-  });
+  };
+  reviews.push(review);
   dirty = true;
   document.getElementById('addOverlay').classList.remove('open');
   render();
-  pushState({ text: 'Added a new review from ' + (reviewer || 'Anonymous') + ' (' + platform + ')' });
+  pushOps({ upsert: [review], logEntry: { text: 'Added a new review from ' + (reviewer || 'Anonymous') + ' (' + platform + ')' } });
   generateReply(id, false);
 });
 
@@ -647,7 +673,7 @@ document.getElementById('cancelBulk').addEventListener('click', () => {
 document.getElementById('submitBulk').addEventListener('click', async () => {
   const raw = document.getElementById('bulkText').value;
   const lines = raw.split('\n').map(l => l.trim()).filter(Boolean);
-  const newIds = [];
+  const newReviews = [];
   lines.forEach(line => {
     const parts = line.split('|').map(p => p.trim());
     if (parts.length < 5) return;
@@ -655,7 +681,7 @@ document.getElementById('submitBulk').addEventListener('click', async () => {
     const text = rest.join('|').trim();
     if (!text) return;
     const id = 'r-' + Date.now() + '-' + Math.random().toString(36).slice(2, 7);
-    reviews.push({
+    const review = {
       id,
       platform: /trustpilot/i.test(platform) ? 'Trustpilot' : 'G2',
       reviewer,
@@ -664,17 +690,18 @@ document.getElementById('submitBulk').addEventListener('click', async () => {
       text,
       reply: '',
       status: 'needs_reply'
-    });
-    newIds.push(id);
+    };
+    reviews.push(review);
+    newReviews.push(review);
   });
   document.getElementById('bulkOverlay').classList.remove('open');
-  if (newIds.length === 0) { showToast('No valid lines found'); return; }
+  if (newReviews.length === 0) { showToast('No valid lines found'); return; }
   dirty = true;
   render();
-  await pushState({ text: 'Added ' + newIds.length + ' new review' + (newIds.length > 1 ? 's' : '') + ' (bulk paste)' });
-  showToast('Adding ' + newIds.length + ' review(s) and drafting replies…');
-  for (const id of newIds) {
-    await generateReply(id, false);
+  await pushOps({ upsert: newReviews, logEntry: { text: 'Added ' + newReviews.length + ' new review' + (newReviews.length > 1 ? 's' : '') + ' (bulk paste)' } });
+  showToast('Adding ' + newReviews.length + ' review(s) and drafting replies…');
+  for (const review of newReviews) {
+    await generateReply(review.id, false);
   }
 });
 
