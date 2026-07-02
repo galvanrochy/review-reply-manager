@@ -22,6 +22,10 @@ const ACTIVITY_KEY = 'reviews:activity';
 const INIT_KEY = 'reviews:initialized';
 const ACTIVITY_MAX = 100;
 
+// One-time migration from the previous single-key JSON blob (pre per-review hash).
+const LEGACY_KEY = 'review-reply-manager:state:v1';
+const MIGRATED_KEY = 'reviews:migrated:legacyv1';
+
 export const DEFAULT_SETTINGS = { companyName: 'Hire Overseas', signerName: '', toneMode: 'founder' };
 
 // Seed data used only the first time the store is empty. Pulled from the G2 and
@@ -106,8 +110,58 @@ export async function ensureSeeded() {
   await redis(['SET', INIT_KEY, '1']);
 }
 
+function hasWork(r) {
+  return Boolean((r && (r.reply || '').trim()) || (r && r.status && r.status !== 'needs_reply'));
+}
+
+// Backfill real work from the old single-key blob into the new per-review hash,
+// exactly once. Non-destructive: a legacy review is imported only when the new
+// store either doesn't have that id yet, or still has it as an untouched seed
+// (empty reply + needs_reply) — so it can never overwrite an edit made in the new
+// store. Settings/activity are imported only when the new ones are still empty/default.
+async function migrateLegacyOnce() {
+  const done = await redis(['GET', MIGRATED_KEY]);
+  if (done) return;
+  try {
+    const legacyRaw = await redis(['GET', LEGACY_KEY]);
+    if (legacyRaw) {
+      const legacy = JSON.parse(legacyRaw);
+
+      if (Array.isArray(legacy.reviews) && legacy.reviews.length) {
+        const currentById = new Map(parseHash(await redis(['HGETALL', HASH_KEY])).map(r => [String(r.id), r]));
+        const flat = [];
+        for (const lr of legacy.reviews) {
+          if (!lr || !lr.id) continue;
+          const cur = currentById.get(String(lr.id));
+          if (!cur || (hasWork(lr) && !hasWork(cur))) {
+            flat.push(String(lr.id), JSON.stringify(lr));
+          }
+        }
+        if (flat.length) await redis(['HSET', HASH_KEY, ...flat]);
+      }
+
+      if (legacy.settings) {
+        let curSettings = {};
+        try { curSettings = JSON.parse((await redis(['GET', SETTINGS_KEY])) || '{}'); } catch { /* ignore */ }
+        const stillDefault = JSON.stringify(Object.assign({}, DEFAULT_SETTINGS, curSettings)) === JSON.stringify(DEFAULT_SETTINGS);
+        if (stillDefault) await redis(['SET', SETTINGS_KEY, JSON.stringify(Object.assign({}, DEFAULT_SETTINGS, legacy.settings))]);
+      }
+
+      if (Array.isArray(legacy.activityLog) && legacy.activityLog.length) {
+        const len = await redis(['LLEN', ACTIVITY_KEY]);
+        if (!len) {
+          const vals = legacy.activityLog.slice(0, ACTIVITY_MAX).map(e => JSON.stringify(e));
+          if (vals.length) await redis(['RPUSH', ACTIVITY_KEY, ...vals]);
+        }
+      }
+    }
+  } catch { /* legacy blob absent or unparseable — nothing to migrate */ }
+  await redis(['SET', MIGRATED_KEY, '1']);
+}
+
 export async function getFullState() {
   await ensureSeeded();
+  await migrateLegacyOnce();
   const [hashResult, settingsRaw, activityRaw] = await Promise.all([
     redis(['HGETALL', HASH_KEY]),
     redis(['GET', SETTINGS_KEY]),
