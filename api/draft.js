@@ -16,7 +16,7 @@ function buildPrompt(review, settings, isRegenerate) {
   const sentiment = sentimentOf(review.rating);
   const company = settings.companyName || 'our company';
   const isFounder = (settings.toneMode || 'founder') === 'founder';
-  const signer = settings.signerName || (isFounder ? 'the founder' : `The ${company} Team`);
+  const signer = (settings.signerName || '').trim();
 
   let toneInstruction;
   if (sentiment === 'negative') {
@@ -31,6 +31,10 @@ function buildPrompt(review, settings, isRegenerate) {
     ? `Write in first person singular ("I"), as the founder of ${company} personally replying — not a support agent. Personal, direct, a little informal, like a founder who actually reads every review. It is fine to briefly reference the company or team, but the voice should read as one person, not "we".`
     : `Write in first person plural ("we"), as the ${company} team replying professionally.`;
 
+  const signOffInstruction = signer
+    ? `- Signs off naturally as "${signer}"`
+    : `- Do NOT add any sign-off, signature, or name at the end. Do not invent a name. End on the last sentence of the reply itself.`;
+
   return `You are drafting a short public reply to a customer review on ${review.platform}.
 Reviewer: ${review.reviewer || 'Anonymous'}
 Rating: ${review.rating}/5 (${sentiment})
@@ -42,7 +46,7 @@ Write a reply of 2-4 sentences that:
 - Thanks or acknowledges the reviewer by name if given
 - References something specific from their review, not generic filler
 - ${toneInstruction}
-- Signs off naturally as "${signer}"
+${signOffInstruction}
 - Avoids corporate jargon, avoids sounding like a template, and avoids excessive exclamation points
 ${isRegenerate ? '- This is a regeneration: use a noticeably different opening line and structure than a typical first draft.' : ''}
 
