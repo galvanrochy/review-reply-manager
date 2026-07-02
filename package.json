@@ -1,0 +1,10 @@
+{
+  "name": "review-reply-manager",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Shared G2 & Trustpilot review reply manager, backed by Vercel serverless functions.",
+  "dependencies": {
+    "@anthropic-ai/sdk": "latest"
+  }
+}

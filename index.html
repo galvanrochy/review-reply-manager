@@ -2,6 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Review Reply Manager</title>
 <style>
   :root { color-scheme: light; }
@@ -43,7 +44,6 @@
   .card {
     background:#fff; border:1px solid #eaecf0; border-radius:12px; padding:16px; margin-bottom:12px;
   }
-  .card.sample { border-style:dashed; }
   .card-top { display:flex; justify-content:space-between; align-items:flex-start; gap:10px; flex-wrap:wrap; margin-bottom:8px; }
   .who { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
   .badge { font-size:11px; font-weight:700; padding:3px 8px; border-radius:6px; color:#fff; }
@@ -68,7 +68,6 @@
     border:1px solid #d0d5dd; border-radius:8px; padding:6px 8px; font-size:12px; background:#fff;
   }
   .spacer { flex:1; }
-  .copied-flag { font-size:12px; color:#027a48; font-weight:600; }
   .empty { text-align:center; padding:60px 20px; color:#6b7280; }
   .empty h3 { color:#1f2328; margin-bottom:6px; }
   .modal-overlay {
@@ -84,15 +83,19 @@
   }
   .field textarea { min-height:80px; resize:vertical; }
   .modal-actions { display:flex; justify-content:flex-end; gap:8px; margin-top:16px; }
-  .settings-panel { display:none; }
-  .settings-panel.open { display:block; }
+  .settings-panel, .activity-panel { display:none; }
+  .settings-panel.open, .activity-panel.open { display:block; }
+  .activity-item { font-size:13px; color:#344054; padding:7px 0; border-bottom:1px solid #f2f4f7; line-height:1.4; }
+  .activity-item:last-child { border-bottom:none; }
+  .activity-time { color:#98a2b3; font-size:11px; margin-right:8px; white-space:nowrap; }
   .toast {
     position:fixed; bottom:20px; left:50%; transform:translateX(-50%);
     background:#1f2328; color:#fff; padding:10px 18px; border-radius:8px; font-size:13px;
-    opacity:0; pointer-events:none; transition:opacity .2s; z-index:100;
+    opacity:0; pointer-events:none; transition:opacity .2s; z-index:100; max-width:90vw; text-align:center;
   }
   .toast.show { opacity:1; }
   .hint { font-size:12px; color:#6b7280; margin-top:-6px; margin-bottom:14px; }
+  #syncBadge.err { color:#b42318; }
   .loading-dot::after { content:"…"; animation: dots 1s steps(4,end) infinite; }
   @keyframes dots { 0%,20%{content:"."} 40%{content:".."} 60%,100%{content:"..."} }
 </style>
@@ -102,29 +105,16 @@
   <header>
     <div>
       <h1>Review Reply Manager</h1>
-      <p class="sub">G2 &amp; Trustpilot review replies, drafted for approval</p>
+      <p class="sub">G2 &amp; Trustpilot review replies, drafted for approval — shared live with your team</p>
     </div>
     <div class="toolbar">
       <span class="hint" id="syncBadge" style="margin:0;"></span>
+      <button class="btn" id="activityBtn">Activity</button>
       <button class="btn" id="settingsBtn">⚙ Settings</button>
       <button class="btn" id="bulkBtn">Bulk paste</button>
       <button class="btn primary" id="addBtn">+ Add review</button>
     </div>
   </header>
-
-  <div class="card" id="syncPanel" style="margin-bottom:16px;">
-    <h2 style="margin-top:0;font-size:15px;">Shared file sync</h2>
-    <p class="hint" style="margin-top:0;">Connect this page to a single JSON file in a folder you and your boss both have access to (Dropbox, Google Drive, OneDrive, etc). Both of you open this same HTML file from your synced folder, connect to the same data file once, and from then on it saves and reloads automatically.</p>
-    <div class="toolbar" style="margin-bottom:0;">
-      <button class="btn" id="createSharedBtn">Create shared file here</button>
-      <button class="btn" id="openSharedBtn">Open existing shared file</button>
-      <span class="spacer"></span>
-      <button class="btn small" id="exportBtn">Export JSON (backup / fallback)</button>
-      <button class="btn small" id="importBtn">Import JSON</button>
-      <input type="file" id="importInput" accept="application/json" style="display:none;">
-    </div>
-    <p class="hint" id="fsaWarning" style="display:none;"></p>
-  </div>
 
   <div class="card settings-panel" id="settingsPanel">
     <h2 style="margin-top:0;font-size:15px;">Brand voice settings</h2>
@@ -143,10 +133,16 @@
       <label>Sign-off name (e.g. "Harlan", "Philip, Co-Founder")</label>
       <input type="text" id="signerName" placeholder="e.g. Harlan">
     </div>
-    <p class="hint">These are used every time a reply is drafted or regenerated.</p>
+    <p class="hint">These are used every time a reply is drafted or regenerated, for everyone.</p>
     <div class="modal-actions">
       <button class="btn primary small" id="saveSettingsBtn">Save settings</button>
     </div>
+  </div>
+
+  <div class="card activity-panel" id="activityPanel">
+    <h2 style="margin-top:0;font-size:15px;">Activity</h2>
+    <p class="hint" style="margin-top:0;">Recent changes made by anyone on the team, newest first.</p>
+    <div id="activityList"></div>
   </div>
 
   <div class="stats" id="stats"></div>
@@ -205,387 +201,181 @@
 <div class="toast" id="toast"></div>
 
 <script>
-const STORAGE_KEY = 'reviewReplyManager.reviews.v1';
-const SETTINGS_KEY = 'reviewReplyManager.settings.v1';
-
+// ---------------------------------------------------------------------------
+// State — mirrored from the shared server (GET /api/reviews). Every local change
+// optimistically updates the UI, then POSTs the full { reviews, settings } to the
+// server. A poll (every ~3.5s and on window focus) pulls in changes anyone else
+// made so they appear without a manual refresh.
+// ---------------------------------------------------------------------------
 let reviews = [];
-let settings = { companyName: '', signerName: '', toneMode: 'founder' };
+let settings = { companyName: 'Hire Overseas', signerName: '', toneMode: 'founder' };
+let activityLog = [];
 let activeFilter = 'all';
+let activityOpen = false;
 
-// Neither platform exposes an API to actually submit a reply (G2 has no reply endpoint at all;
-// Trustpilot's requires a separate backend integration not set up here), so replies still have to
-// be pasted in by hand. These links point at where that reply actually gets typed in.
+let lastServerSnapshot = '';   // JSON of {reviews,settings} we last accepted from the server
+let inflightWrites = 0;        // number of POSTs currently in flight
+let dirty = false;             // true when there are un-persisted local edits (blocks polling)
+let pollTimer = null;
+let replyDebounce = null;
+
+// Neither platform exposes an API to actually submit a reply, so replies still get
+// pasted in by hand. These links point at where that reply actually gets typed in.
 const PLATFORM_REPLY_URLS = {
   G2: 'https://www.g2.com/products/hire-overseas/reviews#reviews',
   Trustpilot: 'https://www.trustpilot.com/review/hireoverseas.com'
 };
 
-function load() {
-  try { reviews = JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]'); } catch(e) { reviews = []; }
-  try { settings = JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}'); } catch(e) { settings = {}; }
-  if (!settings.companyName) settings.companyName = 'Hire Overseas';
-  if (!settings.signerName) settings.signerName = '';
-  if (!settings.toneMode) settings.toneMode = 'founder';
+// ---------------------------------------------------------------------------
+// API helpers
+// ---------------------------------------------------------------------------
+async function apiGet() {
+  const res = await fetch('/api/reviews', { cache: 'no-store' });
+  if (!res.ok) throw new Error((await safeError(res)) || ('HTTP ' + res.status));
+  return res.json();
+}
 
-  if (reviews.length === 0 && localStorage.getItem('reviewReplyManager.seeded') !== '2') {
-    reviews = G2_SEED_REVIEWS.map(r => ({ ...r, reply: '', status: 'needs_reply' }));
-    localStorage.setItem('reviewReplyManager.seeded', '2');
-    save();
-  }
-
-  // One-time merge of Trustpilot reviews (copy-pasted from the Trustpilot profile page on 2026-07-02,
-  // since there's no Trustpilot connector/API access available here). Merges by id so it won't
-  // duplicate or wipe out any reviews/replies already added manually.
-  if (localStorage.getItem('reviewReplyManager.tpSeeded') !== '1') {
-    const existingIds = new Set(reviews.map(r => r.id));
-    TRUSTPILOT_SEED_REVIEWS.forEach(r => {
-      if (!existingIds.has(r.id)) reviews.push({ reply: '', status: 'needs_reply', ...r });
+async function pushState(logEntry) {
+  inflightWrites++;
+  try {
+    const res = await fetch('/api/reviews', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ reviews, settings, logEntry: logEntry || null })
     });
-    localStorage.setItem('reviewReplyManager.tpSeeded', '1');
-    save();
+    if (!res.ok) throw new Error((await safeError(res)) || ('HTTP ' + res.status));
+    const data = await res.json();
+    activityLog = data.activityLog || activityLog;
+    lastServerSnapshot = JSON.stringify({ reviews: data.reviews || [], settings: data.settings || {} });
+    dirty = false;
+    renderActivity();
+    setSyncBadge('ok');
+  } catch (err) {
+    setSyncBadge('err');
+    showToast('Could not save changes: ' + err.message);
+  } finally {
+    inflightWrites--;
   }
 }
 
-// Pulled from https://www.g2.com/products/hire-overseas/reviews on 2026-07-02.
-// G2 has no public API for posting replies, so these are loaded once as a starting point —
-// use "Bulk paste" or "Add review" to bring in newer G2 reviews and all Trustpilot reviews.
-const G2_SEED_REVIEWS = [
-  { id: 'g2-1', platform: 'G2', reviewer: 'Lindsay G.', rating: 5, date: '2026-06-26',
-    text: "Definitely the service. Philip and the team were extremely responsive and proactive throughout the process. They lined up strong candidates quickly, helped screen them, coordinated the take-home exercise, and stayed very hands-on through onboarding. Their pricing was also very reasonable for the quality of support and candidates." },
-  { id: 'g2-2', platform: 'G2', reviewer: 'Kurush D.', rating: 5, date: '2026-06-28',
-    text: "I really like that Hire Overseas has helped with all our communication, marketing material, and social media, handling everything like go-to-market tasks which our team does not have the bandwidth or specialty for. The quality of the candidates they've provided has been probably the best I've ever seen. The founding team is very responsive to our needs and offers great customer service. Dislike: the pricing is a little bit on the higher side, but it's probably the value that you're getting." },
-  { id: 'g2-3', platform: 'G2', reviewer: 'Verified User (Hospital & Health Care)', rating: 5, date: '2026-06-29',
-    text: "The white glove service - they are highly communicative, offering a personalized approach. They solved our staffing issues, and we were able to get a highly qualified remote assistant very quickly. We needed a daily bookkeeper and they provided an amazing hire for us." },
-  { id: 'g2-4', platform: 'G2', reviewer: 'Verified User (Computer Software)', rating: 5, date: '2026-06-29',
-    text: "The hiring process was organized, communication was clear, and the team was responsive. Overall, they've made finding and working with international professionals a smooth and positive experience. Our Customer Success and SEO Specialist was hired through Hire Overseas, and the experience was smooth, transparent, and well-organized from start to finish." },
-  { id: 'g2-5', platform: 'G2', reviewer: 'Thomas D.', rating: 5, date: '2026-06-30',
-    text: "All of the work is done by Harlan, Philip and their team. There's no upfront investment to see candidates and they get you great matches quickly. Even when we had a candidate that wasn't a good match, we had new interviews lined up and hired a replacement that week." },
-  { id: 'g2-6', platform: 'G2', reviewer: 'Jeremiah S.', rating: 5, date: '2026-06-27',
-    text: "The smoothness of the process. One call and they immediately understood my needs and got me the right fit. There were no outright downsides. Whenever I had an issue, they immediately responded." },
-  { id: 'g2-7', platform: 'G2', reviewer: 'Alisa C.', rating: 5, date: '2026-06-30',
-    text: "Harlan is super helpful and responsive, empathetic and goes the extra mile. Dislike: it can be hard to get used to overseas employees." }
-];
-
-// Pulled from https://www.trustpilot.com/review/hireoverseas.com (pasted by the user on 2026-07-02).
-// Trustpilot has no MCP connector available here, so this is a one-time snapshot —
-// use "Bulk paste" or "Add review" for anything newer.
-//
-// IDs are Trustpilot's own review IDs (the hash in each review's /reviews/<id> URL), not
-// sequential numbers. This is deliberate: every time the user pastes the Trustpilot page again,
-// Claude re-extracts each review's real ID from its URL and diffs against the ids already in this
-// file. Reviews whose ID already exists here are left untouched (whatever reply/status was set
-// stays); only ids that have never been seen before are genuinely new and get added with a fresh
-// AI-drafted reply. If a pasted review already shows a "Reply from Hire Overseas" under it,
-// Claude should add it with status: 'posted' instead of 'needs_reply' since it's already answered.
-const TRUSTPILOT_SEED_REVIEWS = [
-  { id: 'tp-6a43bacca66ad51235f02e9c', platform: 'Trustpilot', reviewer: 'Alisa Cohn', rating: 5, date: '2026-07-01',
-    text: "I've been working with Harlan at HireOverseas for over 1 year and he's always so helpful and supportive. If there are issues he gets involved and helps to find solutions and he and the team go above and beyond. I've been working with the VA they found for me for over 1 year who is excellent." },
-  { id: 'tp-6a42bc16309c159e281b35f4', platform: 'Trustpilot', reviewer: 'Kristen A', rating: 5, date: '2026-06-30',
-    text: "The team at Hire Overseas is very responsive and easy to work with. Not only did they connect us with well qualified people, they helped us understand the culture of the people we were interviewing and ultimately hiring, which has helped us integrate them into our team more seamlessly." },
-  { id: 'tp-6a42b805d7234daaac0a7f9e', platform: 'Trustpilot', reviewer: 'Cassie Saquing', rating: 5, date: '2026-06-30',
-    text: "The high level of communication from the entire team at Hire Overseas is phenomenal! From the first search and interview to final hire date, the process is so smooth and clear. We have received highly qualified candidates every time we asked and have made excellent hires with Hire Overseas. Highly recommend if you are looking for healthcare admin or accounting support!!" },
-  { id: 'tp-6a4295d19f687248d19ff8de', platform: 'Trustpilot', reviewer: 'Jacob Diament', rating: 5, date: '2026-06-30',
-    text: "Harlan was great to work with and very Helpful" },
-  { id: 'tp-6a42937c1112c7af1e90ed42', platform: 'Trustpilot', reviewer: 'ThinAir Consulting', rating: 5, date: '2026-06-30',
-    text: "Amazing Experience, great to work with and really helped out our business" },
-  { id: 'tp-6a3f5d916fc2184e8cd703cc', platform: 'Trustpilot', reviewer: 'Jeremiah Sekyi', rating: 5, date: '2026-06-28',
-    text: "Had an absolutely wonderful experience with this company. Highly professional and committed to excellence. I wish I had found this service sooner." },
-  { id: 'tp-6a3eec45714921fe0151c66d', platform: 'Trustpilot', reviewer: 'Tyler Moody', rating: 5, date: '2026-06-27',
-    text: "Amazing team and even better talent finders! Process is smooth every time and always know how to find the best fit for the job!" },
-  { id: 'tp-6a3ee91fad0217ceb6488a98', platform: 'Trustpilot', reviewer: 'Peter Arian', rating: 5, date: '2026-06-27',
-    text: "Incredibly helpful team. The quality of talent has been a significant value add for us. I can't recommend enough" },
-  { id: 'tp-6a3d025bc757fe1fb58ed1dd', platform: 'Trustpilot', reviewer: 'Jackson Greathouse Fall', rating: 5, date: '2026-06-26',
-    text: "Incredibly positive experience with HireOverseas, initial pilot program exceeded expectations and we're looking forward to continuing integrating into our hiring. Can't recommend enough for smooth onboarding with top talent end to end" }
-];
-
-let writeDebounceTimer = null;
-function save() {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(reviews));
-  localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
-  if (sharedFileHandle && !suppressNextWrite) {
-    clearTimeout(writeDebounceTimer);
-    writeDebounceTimer = setTimeout(writeSharedFile, 400);
-  }
-  suppressNextWrite = false;
-}
-
-// ---------------------------------------------------------------------------
-// Shared file sync (File System Access API) — lets two people on two different
-// machines both read/write the same JSON file (placed in a Dropbox/Drive/OneDrive
-// folder they both have access to) so the sheet stays in sync between them.
-// Falls back to manual Export/Import JSON if the browser doesn't support this API
-// (e.g. Safari, Firefox, or if running inside a sandboxed embed that blocks it).
-// ---------------------------------------------------------------------------
-let sharedFileHandle = null;
-let lastKnownFileModified = 0;
-let suppressNextWrite = false;
-let pollTimer = null;
-const supportsFSA = typeof window.showOpenFilePicker === 'function' && typeof window.showSaveFilePicker === 'function';
-
-function idbOpen() {
-  return new Promise((resolve, reject) => {
-    const req = indexedDB.open('reviewReplyManagerDB', 1);
-    req.onupgradeneeded = () => req.result.createObjectStore('handles');
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
+async function apiDraft(review, isRegenerate) {
+  const res = await fetch('/api/draft', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ review, settings, isRegenerate: !!isRegenerate })
   });
-}
-async function idbSet(key, val) {
-  try {
-    const db = await idbOpen();
-    return new Promise((resolve, reject) => {
-      const tx = db.transaction('handles', 'readwrite');
-      tx.objectStore('handles').put(val, key);
-      tx.oncomplete = resolve;
-      tx.onerror = () => reject(tx.error);
-    });
-  } catch (e) { /* ignore */ }
-}
-async function idbGet(key) {
-  try {
-    const db = await idbOpen();
-    return new Promise((resolve, reject) => {
-      const tx = db.transaction('handles', 'readonly');
-      const req = tx.objectStore('handles').get(key);
-      req.onsuccess = () => resolve(req.result);
-      req.onerror = () => reject(req.error);
-    });
-  } catch (e) { return null; }
+  if (!res.ok) throw new Error((await safeError(res)) || ('HTTP ' + res.status));
+  const data = await res.json();
+  return data.reply || '';
 }
 
-async function verifyPermission(handle, readWrite) {
-  const opts = readWrite ? { mode: 'readwrite' } : {};
-  if ((await handle.queryPermission(opts)) === 'granted') return true;
-  if ((await handle.requestPermission(opts)) === 'granted') return true;
-  return false;
+async function safeError(res) {
+  try { const d = await res.json(); return d && d.error; } catch { return null; }
 }
 
-async function createSharedFile() {
-  if (!supportsFSA) { showToast("This browser can't do direct file syncing — use Export/Import instead."); return; }
+// ---------------------------------------------------------------------------
+// Polling
+// ---------------------------------------------------------------------------
+function startPolling() {
+  if (pollTimer) clearInterval(pollTimer);
+  pollTimer = setInterval(poll, 3500);
+  window.addEventListener('focus', poll);
+}
+
+async function poll() {
+  if (inflightWrites > 0 || dirty) return;  // don't clobber un-saved local work
   try {
-    const handle = await window.showSaveFilePicker({
-      suggestedName: 'reviews-data.json',
-      types: [{ description: 'Reviews data', accept: { 'application/json': ['.json'] } }]
-    });
-    const ok = await verifyPermission(handle, true);
-    if (!ok) { showToast('Permission denied for that file.'); return; }
-    sharedFileHandle = handle;
-    await idbSet('sharedFileHandle', handle);
-    await writeSharedFile();
-    startPolling();
-    updateSyncBadge();
-    showToast('Shared file created — this device will now sync to it automatically.');
-  } catch (e) {
-    if (e.name !== 'AbortError') showToast('Could not create the shared file.');
+    const data = await apiGet();
+    applyRemote(data);
+  } catch (err) {
+    setSyncBadge('err');
   }
 }
 
-async function openSharedFile() {
-  if (!supportsFSA) { showToast("This browser can't do direct file syncing — use Export/Import instead."); return; }
+function applyRemote(data) {
+  activityLog = data.activityLog || [];
+  renderActivity();
+  setSyncBadge('ok');
+
+  const snapshot = JSON.stringify({ reviews: data.reviews || [], settings: data.settings || {} });
+  if (snapshot === lastServerSnapshot) return;
+
+  // Don't yank the list out from under someone mid-edit; re-apply on the next poll.
+  const active = document.activeElement;
+  if (active && active.classList && active.classList.contains('reply')) return;
+
+  lastServerSnapshot = snapshot;
+  reviews = data.reviews || [];
+  settings = Object.assign({ companyName: 'Hire Overseas', signerName: '', toneMode: 'founder' }, data.settings || {});
+  render();
+}
+
+function setSyncBadge(state) {
+  const el = document.getElementById('syncBadge');
+  if (!el) return;
+  el.classList.toggle('err', state === 'err');
+  if (state === 'ok') el.textContent = '✓ Synced';
+  else if (state === 'loading') el.textContent = '… Syncing';
+  else el.textContent = '⚠ Offline — changes may not be saving';
+}
+
+// ---------------------------------------------------------------------------
+// Reply drafting
+// ---------------------------------------------------------------------------
+async function generateReply(id, isRegenerate) {
+  const review = reviews.find(r => r.id === id);
+  if (!review) return;
+  render(true, id);
   try {
-    const [handle] = await window.showOpenFilePicker({
-      types: [{ description: 'Reviews data', accept: { 'application/json': ['.json'] } }]
+    const reply = await apiDraft(review, isRegenerate);
+    review.reply = reply;
+    if (!review.status) review.status = 'needs_reply';
+    dirty = true;
+    render();
+    await pushState({
+      text: (isRegenerate ? 'Regenerated the reply for ' : 'Drafted a reply for ')
+        + (review.reviewer || 'Anonymous') + ' (' + review.platform + ')'
     });
-    const ok = await verifyPermission(handle, true);
-    if (!ok) { showToast('Permission denied for that file.'); return; }
-    sharedFileHandle = handle;
-    await idbSet('sharedFileHandle', handle);
-    await loadFromSharedFile(true);
-    startPolling();
-    updateSyncBadge();
-    showToast('Connected — loaded the shared data and will keep syncing automatically.');
-  } catch (e) {
-    if (e.name !== 'AbortError') showToast('Could not open that file.');
-  }
-}
-
-async function reconnectSharedFileOnLoad() {
-  if (!supportsFSA) return;
-  const handle = await idbGet('sharedFileHandle');
-  if (!handle) return;
-  try {
-    const granted = await handle.queryPermission({ mode: 'readwrite' });
-    if (granted === 'granted') {
-      sharedFileHandle = handle;
-      await loadFromSharedFile(true);
-      startPolling();
-      updateSyncBadge();
-    } else {
-      sharedFileHandle = handle;
-      updateSyncBadge(true);
-    }
-  } catch (e) { /* handle may point at a file that moved/was deleted */ }
-}
-
-async function loadFromSharedFile(applyToState) {
-  if (!sharedFileHandle) return;
-  const file = await sharedFileHandle.getFile();
-  lastKnownFileModified = file.lastModified;
-  const text = await file.text();
-  if (!text.trim()) { await writeSharedFile(); return; }
-  let data;
-  try { data = JSON.parse(text); } catch (e) { return; }
-  if (applyToState && data && Array.isArray(data.reviews)) {
-    reviews = data.reviews;
-    settings = { ...settings, ...(data.settings || {}) };
-    suppressNextWrite = true;
-    save();
+  } catch (err) {
+    showToast('Could not draft a reply: ' + err.message);
     render();
   }
 }
 
-async function writeSharedFile() {
-  if (!sharedFileHandle) return;
-  try {
-    const perm = await sharedFileHandle.queryPermission({ mode: 'readwrite' });
-    if (perm !== 'granted') { updateSyncBadge(true); return; }
-    const writable = await sharedFileHandle.createWritable();
-    await writable.write(JSON.stringify({ reviews, settings }, null, 2));
-    await writable.close();
-    const file = await sharedFileHandle.getFile();
-    lastKnownFileModified = file.lastModified;
-  } catch (e) { /* file may be temporarily locked by the sync client — next change will retry */ }
-}
-
-function startPolling() {
-  if (pollTimer) clearInterval(pollTimer);
-  pollTimer = setInterval(checkForRemoteChanges, 8000);
-  window.addEventListener('focus', checkForRemoteChanges);
-}
-async function checkForRemoteChanges() {
-  if (!sharedFileHandle) return;
-  try {
-    const file = await sharedFileHandle.getFile();
-    if (file.lastModified > lastKnownFileModified) await loadFromSharedFile(true);
-  } catch (e) { /* ignore transient errors */ }
-}
-
-function updateSyncBadge(needsReconnect) {
-  const el = document.getElementById('syncBadge');
-  if (!el) return;
-  if (!sharedFileHandle) { el.textContent = ''; el.onclick = null; el.style.cursor = ''; return; }
-  if (needsReconnect) {
-    el.textContent = '⚠ Shared file needs reconnecting — click here';
-    el.style.cursor = 'pointer';
-    el.onclick = () => openSharedFile();
-  } else {
-    el.textContent = '✓ Synced to shared file';
-    el.style.cursor = '';
-    el.onclick = null;
-  }
-}
-
-function exportJSON() {
-  const blob = new Blob([JSON.stringify({ reviews, settings }, null, 2)], { type: 'application/json' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url; a.download = 'reviews-data.json';
-  document.body.appendChild(a); a.click(); document.body.removeChild(a);
-  URL.revokeObjectURL(url);
-  showToast('Downloaded reviews-data.json');
-}
-
-function importJSONFile(file) {
-  const reader = new FileReader();
-  reader.onload = () => {
-    try {
-      const data = JSON.parse(reader.result);
-      if (!Array.isArray(data.reviews)) throw new Error('bad shape');
-      reviews = data.reviews;
-      settings = { ...settings, ...(data.settings || {}) };
-      save();
-      render();
-      showToast('Imported shared data.');
-    } catch (e) { showToast('That file could not be read as reviews data.'); }
-  };
-  reader.readAsText(file);
-}
-
-function sentimentOf(rating) {
-  if (rating >= 4) return 'positive';
-  if (rating === 3) return 'neutral';
-  return 'negative';
-}
-
-function stars(n) {
-  return '★★★★★'.slice(0,n) + '☆☆☆☆☆'.slice(0, 5-n);
-}
-
-function showToast(msg) {
-  const t = document.getElementById('toast');
-  t.textContent = msg;
-  t.classList.add('show');
-  setTimeout(()=>t.classList.remove('show'), 1800);
-}
-
-const hasAI = typeof window.cowork !== 'undefined' && typeof window.cowork.askClaude === 'function';
-
-async function askClaudeSafe(prompt) {
-  if (!hasAI) return null;
-  try {
-    const res = await window.cowork.askClaude(prompt, []);
-    if (typeof res === 'string') return res.trim();
-    if (res && typeof res.content === 'string') return res.content.trim();
-    if (res && Array.isArray(res.content)) return res.content.map(c => c.text || '').join('').trim();
-    if (res && typeof res.text === 'string') return res.text.trim();
-    return JSON.stringify(res);
-  } catch (e) {
-    return null;
-  }
-}
-
-function buildPrompt(review, isRegenerate) {
-  const sentiment = sentimentOf(review.rating);
-  const company = settings.companyName || 'our company';
-  const isFounder = (settings.toneMode || 'founder') === 'founder';
-  const signer = settings.signerName || (isFounder ? 'the founder' : `The ${company} Team`);
-  let toneInstruction;
-  if (sentiment === 'negative') {
-    toneInstruction = 'Apologize sincerely, take ownership without being defensive, and invite them to continue the conversation privately (e.g. by email) so it can be made right. Do not be overly formal or robotic.';
-  } else if (sentiment === 'neutral') {
-    toneInstruction = 'Acknowledge both the positive and the constructive parts of their feedback, and mention that the feedback is being taken on board.';
-  } else {
-    toneInstruction = 'Be warm, specific, and genuine. Avoid generic phrases like "we appreciate your feedback" or "thank you for your kind words."';
-  }
-  const voiceInstruction = isFounder
-    ? `Write in first person singular ("I"), as the founder of ${company} personally replying — not a support agent. Personal, direct, a little informal, like a founder who actually reads every review. It is fine to briefly reference the company or team, but the voice should read as one person, not "we".`
-    : `Write in first person plural ("we"), as the ${company} team replying professionally.`;
-  return `You are drafting a short public reply to a customer review on ${review.platform}.
-Reviewer: ${review.reviewer || 'Anonymous'}
-Rating: ${review.rating}/5 (${sentiment})
-Review text: "${review.text}"
-
-${voiceInstruction}
-
-Write a reply of 2-4 sentences that:
-- Thanks or acknowledges the reviewer by name if given
-- References something specific from their review, not generic filler
-- ${toneInstruction}
-- Signs off naturally as "${signer}"
-- Avoids corporate jargon, avoids sounding like a template, and avoids excessive exclamation points
-${isRegenerate ? '- This is a regeneration: use a noticeably different opening line and structure than a typical first draft.' : ''}
-
-Return ONLY the reply text. No preamble, no quotation marks around it.`;
-}
-
-async function generateReply(id, isRegenerate) {
+// ---------------------------------------------------------------------------
+// Local mutations (optimistic → POST)
+// ---------------------------------------------------------------------------
+function updateReplyText(id, value) {
   const review = reviews.find(r => r.id === id);
   if (!review) return;
-  if (!hasAI) {
-    showToast("AI drafting only works inside Claude/Cowork. Edit the reply box directly, or ask whoever has Claude open to draft it — it'll sync in.");
-    return;
-  }
-  render(true, id);
-  const prompt = buildPrompt(review, isRegenerate);
-  const result = await askClaudeSafe(prompt);
-  if (result) {
-    review.reply = result;
-    if (review.status === 'needs_reply' || !review.status) review.status = 'needs_reply';
-  } else {
-    showToast('Could not generate a reply right now — try again.');
-  }
-  save();
+  review.reply = value;
+  dirty = true;
+  clearTimeout(replyDebounce);
+  replyDebounce = setTimeout(() => pushState(null), 500);
+}
+
+function updateStatus(id, value) {
+  const review = reviews.find(r => r.id === id);
+  if (!review) return;
+  const wasPosted = review.status === 'posted';
+  review.status = value;
+  dirty = true;
   render();
+  const log = (value === 'posted' && !wasPosted)
+    ? { text: 'Marked ' + (review.reviewer || 'Anonymous') + "'s reply as posted" }
+    : null;
+  pushState(log);
+}
+
+function deleteReview(id) {
+  const review = reviews.find(r => r.id === id);
+  if (!confirm('Delete this review?')) return;
+  reviews = reviews.filter(r => r.id !== id);
+  dirty = true;
+  render();
+  pushState(review
+    ? { text: 'Deleted the review from ' + (review.reviewer || 'Anonymous') + ' (' + review.platform + ')' }
+    : null);
 }
 
 function copyReply(id) {
@@ -607,37 +397,59 @@ function fallbackCopy(text, cb) {
   ta.style.opacity = '0';
   document.body.appendChild(ta);
   ta.select();
-  try { document.execCommand('copy'); } catch(e) {}
+  try { document.execCommand('copy'); } catch (e) {}
   document.body.removeChild(ta);
   cb();
 }
 
-function updateReplyText(id, value) {
-  const review = reviews.find(r => r.id === id);
-  if (!review) return;
-  review.reply = value;
-  save();
+// ---------------------------------------------------------------------------
+// Small helpers
+// ---------------------------------------------------------------------------
+function sentimentOf(rating) {
+  if (rating >= 4) return 'positive';
+  if (rating === 3) return 'neutral';
+  return 'negative';
 }
 
-function updateStatus(id, value) {
-  const review = reviews.find(r => r.id === id);
-  if (!review) return;
-  review.status = value;
-  save();
-  render();
+function stars(n) {
+  return '★★★★★'.slice(0, n) + '☆☆☆☆☆'.slice(0, 5 - n);
 }
 
-function deleteReview(id) {
-  if (!confirm('Delete this review?')) return;
-  reviews = reviews.filter(r => r.id !== id);
-  save();
-  render();
+function showToast(msg) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.classList.add('show');
+  setTimeout(() => t.classList.remove('show'), 2400);
 }
 
+function escapeHtml(str) {
+  const div = document.createElement('div');
+  div.textContent = str || '';
+  return div.innerHTML;
+}
+
+function formatTime(iso) {
+  if (!iso) return '';
+  const then = new Date(iso).getTime();
+  if (isNaN(then)) return '';
+  const diff = Math.max(0, Date.now() - then);
+  const min = Math.floor(diff / 60000);
+  if (min < 1) return 'just now';
+  if (min < 60) return min + 'm ago';
+  const hr = Math.floor(min / 60);
+  if (hr < 24) return hr + 'h ago';
+  const d = Math.floor(hr / 24);
+  if (d < 7) return d + 'd ago';
+  return new Date(iso).toLocaleDateString();
+}
+
+// ---------------------------------------------------------------------------
+// Rendering
+// ---------------------------------------------------------------------------
 function renderStats() {
   const total = reviews.length;
   const needsReply = reviews.filter(r => r.status === 'needs_reply' || !r.status).length;
-  const avg = total ? (reviews.reduce((s,r)=>s+Number(r.rating),0)/total).toFixed(1) : '–';
+  const avg = total ? (reviews.reduce((s, r) => s + Number(r.rating), 0) / total).toFixed(1) : '–';
   const negative = reviews.filter(r => sentimentOf(r.rating) === 'negative').length;
   document.getElementById('stats').innerHTML = `
     <div class="stat"><div class="n">${total}</div><div class="l">Total reviews</div></div>
@@ -649,11 +461,11 @@ function renderStats() {
 
 function renderChips() {
   const chips = [
-    ['all','All'], ['G2','G2'], ['Trustpilot','Trustpilot'],
-    ['needs_reply','Needs reply'], ['approved','Approved'], ['posted','Posted'], ['negative','Negative']
+    ['all', 'All'], ['G2', 'G2'], ['Trustpilot', 'Trustpilot'],
+    ['needs_reply', 'Needs reply'], ['approved', 'Approved'], ['posted', 'Posted'], ['negative', 'Negative']
   ];
-  document.getElementById('filterChips').innerHTML = chips.map(([val,label]) =>
-    `<button class="chip ${activeFilter===val?'active':''}" data-filter="${val}">${label}</button>`
+  document.getElementById('filterChips').innerHTML = chips.map(([val, label]) =>
+    `<button class="chip ${activeFilter === val ? 'active' : ''}" data-filter="${val}">${label}</button>`
   ).join('');
   document.querySelectorAll('.chip').forEach(el => {
     el.addEventListener('click', () => { activeFilter = el.dataset.filter; render(); });
@@ -661,7 +473,7 @@ function renderChips() {
 }
 
 function filteredReviews() {
-  let list = [...reviews].sort((a,b) => (b.date||'').localeCompare(a.date||''));
+  let list = [...reviews].sort((a, b) => (b.date || '').localeCompare(a.date || ''));
   if (activeFilter === 'all') return list;
   if (activeFilter === 'G2' || activeFilter === 'Trustpilot') return list.filter(r => r.platform === activeFilter);
   if (activeFilter === 'negative') return list.filter(r => sentimentOf(r.rating) === 'negative');
@@ -681,14 +493,13 @@ function render(loadingOnly, loadingId) {
     const sentiment = sentimentOf(r.rating);
     const isLoading = loadingOnly && r.id === loadingId;
     return `
-    <div class="card ${r.isSample ? 'sample' : ''}" data-id="${r.id}">
+    <div class="card" data-id="${r.id}">
       <div class="card-top">
         <div class="who">
           <span class="badge ${r.platform}">${r.platform}</span>
           <span class="name">${escapeHtml(r.reviewer || 'Anonymous')}</span>
           <span class="stars">${stars(Number(r.rating))}</span>
           <span class="sentiment ${sentiment}">${sentiment}</span>
-          ${r.isSample ? '<span class="date">(sample — delete anytime)</span>' : ''}
         </div>
         <span class="date">${r.date || ''}</span>
       </div>
@@ -696,19 +507,19 @@ function render(loadingOnly, loadingId) {
       <div class="reply-label">Suggested reply</div>
       ${isLoading
         ? `<div class="hint loading-dot" style="margin-bottom:8px;">Drafting reply</div>`
-        : `<textarea class="reply" data-id="${r.id}" placeholder="Click Regenerate to draft a reply">${escapeHtml(r.reply || '')}</textarea>`
+        : `<textarea class="reply" data-id="${r.id}" placeholder="Click Draft reply to generate a reply">${escapeHtml(r.reply || '')}</textarea>`
       }
       <div class="row-actions">
-        <button class="btn small" data-action="regenerate" data-id="${r.id}" ${isLoading?'disabled':''} title="${hasAI ? '' : 'AI drafting needs Claude/Cowork open — click for details'}">${r.reply ? 'Regenerate' : 'Draft reply'}${hasAI ? '' : ' (needs Claude)'}</button>
-        <button class="btn small" data-action="copy" data-id="${r.id}" ${!r.reply?'disabled':''}>Copy</button>
-        <a class="btn small ${!r.reply?'disabled':''}" href="${PLATFORM_REPLY_URLS[r.platform] || '#'}" target="_blank" rel="noopener"
-           data-action="copy-and-open" data-id="${r.id}" ${!r.reply?'tabindex="-1" aria-disabled="true" onclick="return false;"':''}>
+        <button class="btn small" data-action="regenerate" data-id="${r.id}" ${isLoading ? 'disabled' : ''}>${r.reply ? 'Regenerate' : 'Draft reply'}</button>
+        <button class="btn small" data-action="copy" data-id="${r.id}" ${!r.reply ? 'disabled' : ''}>Copy</button>
+        <a class="btn small ${!r.reply ? 'disabled' : ''}" href="${PLATFORM_REPLY_URLS[r.platform] || '#'}" target="_blank" rel="noopener"
+           data-action="copy-and-open" data-id="${r.id}" ${!r.reply ? 'tabindex="-1" aria-disabled="true" onclick="return false;"' : ''}>
           Copy &amp; open ${r.platform}
         </a>
         <select class="status" data-action="status" data-id="${r.id}">
-          <option value="needs_reply" ${(!r.status||r.status==='needs_reply')?'selected':''}>Needs reply</option>
-          <option value="approved" ${r.status==='approved'?'selected':''}>Approved</option>
-          <option value="posted" ${r.status==='posted'?'selected':''}>Posted</option>
+          <option value="needs_reply" ${(!r.status || r.status === 'needs_reply') ? 'selected' : ''}>Needs reply</option>
+          <option value="approved" ${r.status === 'approved' ? 'selected' : ''}>Approved</option>
+          <option value="posted" ${r.status === 'posted' ? 'selected' : ''}>Posted</option>
         </select>
         <span class="spacer"></span>
         <button class="btn small danger" data-action="delete" data-id="${r.id}">Delete</button>
@@ -717,7 +528,10 @@ function render(loadingOnly, loadingId) {
   }).join('');
 
   container.querySelectorAll('[data-action="regenerate"]').forEach(el => {
-    el.addEventListener('click', () => generateReply(el.dataset.id, !!reviews.find(r=>r.id===el.dataset.id).reply));
+    el.addEventListener('click', () => {
+      const r = reviews.find(x => x.id === el.dataset.id);
+      generateReply(el.dataset.id, !!(r && r.reply));
+    });
   });
   container.querySelectorAll('[data-action="copy"]').forEach(el => {
     el.addEventListener('click', () => copyReply(el.dataset.id));
@@ -736,13 +550,28 @@ function render(loadingOnly, loadingId) {
   });
 }
 
-function escapeHtml(str) {
-  const div = document.createElement('div');
-  div.textContent = str || '';
-  return div.innerHTML;
+function renderActivity() {
+  const panel = document.getElementById('activityPanel');
+  panel.classList.toggle('open', activityOpen);
+  if (!activityOpen) return;
+  const listEl = document.getElementById('activityList');
+  if (!activityLog.length) {
+    listEl.innerHTML = '<p class="hint" style="margin:0;">No activity yet.</p>';
+    return;
+  }
+  listEl.innerHTML = activityLog.map(e =>
+    `<div class="activity-item"><span class="activity-time">${escapeHtml(formatTime(e.ts))}</span>${escapeHtml(e.text)}</div>`
+  ).join('');
 }
 
-// Settings panel
+// ---------------------------------------------------------------------------
+// Wiring
+// ---------------------------------------------------------------------------
+document.getElementById('activityBtn').addEventListener('click', () => {
+  activityOpen = !activityOpen;
+  renderActivity();
+});
+
 document.getElementById('settingsBtn').addEventListener('click', () => {
   document.getElementById('companyName').value = settings.companyName || '';
   document.getElementById('signerName').value = settings.signerName || '';
@@ -753,17 +582,18 @@ document.getElementById('saveSettingsBtn').addEventListener('click', () => {
   settings.companyName = document.getElementById('companyName').value.trim() || 'Hire Overseas';
   settings.signerName = document.getElementById('signerName').value.trim();
   settings.toneMode = document.getElementById('toneMode').value;
-  save();
+  dirty = true;
   document.getElementById('settingsPanel').classList.remove('open');
   showToast('Settings saved');
   render();
+  pushState(null);
 });
 
 // Add review modal
 document.getElementById('addBtn').addEventListener('click', () => {
   document.getElementById('f_reviewer').value = '';
   document.getElementById('f_text').value = '';
-  document.getElementById('f_date').value = new Date().toISOString().slice(0,10);
+  document.getElementById('f_date').value = new Date().toISOString().slice(0, 10);
   document.getElementById('f_rating').value = '5';
   document.getElementById('f_platform').value = 'G2';
   document.getElementById('addOverlay').classList.add('open');
@@ -774,20 +604,23 @@ document.getElementById('cancelAdd').addEventListener('click', () => {
 document.getElementById('submitAdd').addEventListener('click', () => {
   const text = document.getElementById('f_text').value.trim();
   if (!text) { showToast('Add the review text first'); return; }
-  const id = 'r-' + Date.now() + '-' + Math.random().toString(36).slice(2,7);
+  const id = 'r-' + Date.now() + '-' + Math.random().toString(36).slice(2, 7);
+  const platform = document.getElementById('f_platform').value;
+  const reviewer = document.getElementById('f_reviewer').value.trim();
   reviews.push({
     id,
-    platform: document.getElementById('f_platform').value,
-    reviewer: document.getElementById('f_reviewer').value.trim(),
+    platform,
+    reviewer,
     rating: Number(document.getElementById('f_rating').value),
     date: document.getElementById('f_date').value,
     text,
     reply: '',
     status: 'needs_reply'
   });
-  save();
+  dirty = true;
   document.getElementById('addOverlay').classList.remove('open');
   render();
+  pushState({ text: 'Added a new review from ' + (reviewer || 'Anonymous') + ' (' + platform + ')' });
   generateReply(id, false);
 });
 
@@ -809,58 +642,52 @@ document.getElementById('submitBulk').addEventListener('click', async () => {
     const [platform, reviewer, rating, date, ...rest] = parts;
     const text = rest.join('|').trim();
     if (!text) return;
-    const id = 'r-' + Date.now() + '-' + Math.random().toString(36).slice(2,7);
+    const id = 'r-' + Date.now() + '-' + Math.random().toString(36).slice(2, 7);
     reviews.push({
       id,
       platform: /trustpilot/i.test(platform) ? 'Trustpilot' : 'G2',
       reviewer,
       rating: Number(rating) || 5,
-      date: date || new Date().toISOString().slice(0,10),
+      date: date || new Date().toISOString().slice(0, 10),
       text,
       reply: '',
       status: 'needs_reply'
     });
     newIds.push(id);
   });
-  save();
   document.getElementById('bulkOverlay').classList.remove('open');
-  render();
   if (newIds.length === 0) { showToast('No valid lines found'); return; }
-  showToast(`Adding ${newIds.length} review(s) and drafting replies…`);
+  dirty = true;
+  render();
+  await pushState({ text: 'Added ' + newIds.length + ' new review' + (newIds.length > 1 ? 's' : '') + ' (bulk paste)' });
+  showToast('Adding ' + newIds.length + ' review(s) and drafting replies…');
   for (const id of newIds) {
     await generateReply(id, false);
   }
 });
 
-// Sync panel wiring
-document.getElementById('createSharedBtn').addEventListener('click', createSharedFile);
-document.getElementById('openSharedBtn').addEventListener('click', openSharedFile);
-document.getElementById('exportBtn').addEventListener('click', exportJSON);
-document.getElementById('importBtn').addEventListener('click', () => document.getElementById('importInput').click());
-document.getElementById('importInput').addEventListener('change', (e) => {
-  if (e.target.files && e.target.files[0]) importJSONFile(e.target.files[0]);
-  e.target.value = '';
-});
-
-if (!supportsFSA) {
-  const warn = document.getElementById('fsaWarning');
-  warn.style.display = 'block';
-  warn.textContent = "This browser/view doesn't support direct file syncing (that needs Chrome or Edge, opened as a regular file — not this sandboxed view). Use Export JSON here, send/drop that file in your shared folder, and have the other person use Import JSON to pull it in.";
-  document.getElementById('createSharedBtn').disabled = true;
-  document.getElementById('openSharedBtn').disabled = true;
+// ---------------------------------------------------------------------------
+// Boot
+// ---------------------------------------------------------------------------
+async function init() {
+  setSyncBadge('loading');
+  try {
+    const data = await apiGet();
+    reviews = data.reviews || [];
+    settings = Object.assign({ companyName: 'Hire Overseas', signerName: '', toneMode: 'founder' }, data.settings || {});
+    activityLog = data.activityLog || [];
+    lastServerSnapshot = JSON.stringify({ reviews: data.reviews || [], settings: data.settings || {} });
+    setSyncBadge('ok');
+  } catch (err) {
+    setSyncBadge('err');
+    showToast('Could not load data: ' + err.message);
+  }
+  render();
+  renderActivity();
+  startPolling();
 }
 
-if (!hasAI) {
-  const note = document.createElement('p');
-  note.className = 'hint';
-  note.style.marginTop = '0';
-  note.textContent = 'AI reply drafting is unavailable in this view (needs Claude/Cowork). You can still edit every reply by hand, copy it, and mark reviews as posted — all of that syncs normally.';
-  document.querySelector('.sub').insertAdjacentElement('afterend', note);
-}
-
-load();
-render();
-reconnectSharedFileOnLoad();
+init();
 </script>
 </body>
 </html>
